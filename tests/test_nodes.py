@@ -38,7 +38,14 @@ def test_extension_nodes(custom_node, nodes):
     extension = asyncio.run(custom_node.comfy_entrypoint())
     node_list = asyncio.run(extension.get_node_list())
     ids = [cls.define_schema().node_id for cls in node_list]
-    assert ids == ["IW3LoadDepthModel", "IW3EstimateDepth", "IW3DepthFromImage", "IW3Stereo", "IW3ConvertVideo"]
+    assert ids == [
+        "IW3LoadDepthModel",
+        "IW3EstimateDepth",
+        "IW3DepthFromImage",
+        "IW3Stereo",
+        "IW3ConvertVideo",
+        "IW3StreamDecodeVideo",
+    ]
     for cls in node_list:
         schema = cls.define_schema()
         schema.validate()

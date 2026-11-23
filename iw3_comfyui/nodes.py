@@ -50,6 +50,7 @@ from .pipeline import (  # noqa: E402
     generate_stereo,
     image_to_depth,
 )
+from .stream_decode import VideoFileWriter, stream_temporal_decode  # noqa: E402
 from .video import convert_video_file, resolve_video_source  # noqa: E402
 
 CATEGORY = "iw3"
@@ -622,10 +623,160 @@ class IW3ConvertVideo(io.ComfyNode):
         return io.NodeOutput(result, ui=preview)
 
 
+class IW3StreamDecodeVideo(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="IW3StreamDecodeVideo",
+            display_name="VAE Decode to Video File (streaming)",
+            category=CATEGORY,
+            search_aliases=["stream decode", "low ram decode", "decode to file", "vae decode video"],
+            description=(
+                "Decodes a video latent a chunk of frames at a time and writes each chunk straight to an MP4 "
+                "in the output folder, so RAM use does not grow with video length. Replaces VAE Decode + "
+                "Create Video + Save Video. The VIDEO output can feed iw3 Convert Video directly."
+            ),
+            inputs=[
+                io.Latent.Input("samples"),
+                io.Vae.Input("vae"),
+                io.Float.Input("fps", default=24.0, min=1.0, max=240.0, step=1.0),
+                io.String.Input("filename_prefix", default="video/ComfyUI"),
+                io.Audio.Input("audio", optional=True, tooltip="Muxed into the file, e.g. from VAE Decode Audio."),
+                io.Int.Input("crf", default=18, min=0, max=51, **ADVANCED, tooltip="Lower is higher quality."),
+                io.Int.Input(
+                    "temporal_size",
+                    default=64,
+                    min=8,
+                    max=4096,
+                    step=4,
+                    **ADVANCED,
+                    tooltip="Frames decoded at a time. Lower uses less RAM.",
+                ),
+                io.Int.Input(
+                    "temporal_overlap",
+                    default=8,
+                    min=4,
+                    max=4096,
+                    step=4,
+                    **ADVANCED,
+                    tooltip="Frames shared between chunks, blended to hide the joins.",
+                ),
+                io.Int.Input(
+                    "tile_size",
+                    default=0,
+                    min=0,
+                    max=4096,
+                    step=32,
+                    **ADVANCED,
+                    tooltip="Spatial tile size for VRAM savings, as in VAE Decode (Tiled). 0 = whole frame.",
+                ),
+                io.Int.Input("overlap", default=64, min=0, max=4096, step=32, **ADVANCED),
+            ],
+            hidden=[io.Hidden.prompt, io.Hidden.extra_pnginfo],
+            is_output_node=True,
+            outputs=[io.Video.Output("video")],
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        samples: dict[str, Any],
+        vae: Any,
+        fps: float,
+        filename_prefix: str,
+        audio: dict[str, Any] | None = None,
+        crf: int = 18,
+        temporal_size: int = 64,
+        temporal_overlap: int = 8,
+        tile_size: int = 0,
+        overlap: int = 64,
+    ) -> io.NodeOutput:
+        latent = samples["samples"]
+        if latent.is_nested:
+            latent = latent.unbind()[0]
+
+        # Same parameter handling as ComfyUI's VAE Decode (Tiled).
+        if tile_size and tile_size < overlap * 4:
+            overlap = tile_size // 4
+        if temporal_size < temporal_overlap * 2:
+            temporal_overlap = temporal_overlap // 2
+        compression = vae.spacial_compression_decode()
+
+        def decode(x: torch.Tensor) -> torch.Tensor:
+            if tile_size > 0:
+                t = x.shape[2] if x.ndim == 5 else None
+                images = vae.decode_tiled(
+                    x,
+                    tile_x=tile_size // compression,
+                    tile_y=tile_size // compression,
+                    overlap=overlap // compression,
+                    tile_t=t,
+                    overlap_t=1 if t is not None else None,
+                )
+            else:
+                images = vae.decode(x)
+            return images.reshape(-1, *images.shape[-3:])
+
+        full_output_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
+            filename_prefix, folder_paths.get_output_directory()
+        )
+        file = f"{filename}_{counter:05}_.mp4"
+        path = os.path.join(full_output_folder, file)
+        metadata: dict[str, Any] = {}
+        hidden = cls.hidden  # None when called outside of a ComfyUI prompt
+        if hidden is not None and hidden.extra_pnginfo is not None:
+            metadata.update(hidden.extra_pnginfo)
+        if hidden is not None and hidden.prompt is not None:
+            metadata["prompt"] = hidden.prompt
+
+        writer = VideoFileWriter(path, fps=fps, crf=crf, metadata=metadata or None, audio=audio)
+        try:
+            temporal_compression = vae.temporal_compression_decode()
+            if latent.ndim == 5 and temporal_compression is not None:
+                tile_t = max(2, temporal_size // temporal_compression)
+                overlap_t = max(1, min(tile_t // 2, temporal_overlap // temporal_compression))
+                upscale_t = vae.upscale_ratio[0]
+                index_formula = getattr(vae, "upscale_index_formula", None)
+                index_t = index_formula[0] if index_formula is not None else upscale_t
+                stream_temporal_decode(
+                    latent,
+                    decode,
+                    writer.write,
+                    tile_t=tile_t,
+                    overlap_t=overlap_t,
+                    upscale_t=upscale_t,
+                    index_t=index_t,
+                    progress=_progress_callback(1),
+                )
+            else:
+                # Image VAE: the batch is the frame sequence, decode it in independent chunks.
+                progress = _progress_callback(latent.shape[0])
+                for start in range(0, latent.shape[0], temporal_size):
+                    writer.write(decode(latent[start : start + temporal_size]).float().cpu())
+                    progress(min(start + temporal_size, latent.shape[0]), latent.shape[0])
+            writer.close()
+        except BaseException:
+            writer.abort()
+            if os.path.isfile(path):
+                os.unlink(path)
+            raise
+
+        result = InputImpl.VideoFromFile(path)
+        preview = ui.PreviewVideo([ui.SavedResult(file, subfolder, io.FolderType.output)])
+        return io.NodeOutput(result, ui=preview)
+
+
 class IW3Extension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [IW3LoadDepthModel, IW3EstimateDepth, IW3DepthFromImage, IW3Stereo, IW3ConvertVideo]
+        return [
+            IW3LoadDepthModel,
+            IW3EstimateDepth,
+            IW3DepthFromImage,
+            IW3Stereo,
+            IW3ConvertVideo,
+            IW3StreamDecodeVideo,
+        ]
 
 
 async def comfy_entrypoint() -> IW3Extension:

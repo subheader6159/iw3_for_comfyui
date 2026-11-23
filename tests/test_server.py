@@ -18,7 +18,14 @@ from scene import probe_video, read_frame, render_clip, write_video
 pytestmark = pytest.mark.server
 
 H, W = 256, 448
-IW3_NODES = ["IW3LoadDepthModel", "IW3EstimateDepth", "IW3DepthFromImage", "IW3Stereo", "IW3ConvertVideo"]
+IW3_NODES = [
+    "IW3LoadDepthModel",
+    "IW3EstimateDepth",
+    "IW3DepthFromImage",
+    "IW3Stereo",
+    "IW3ConvertVideo",
+    "IW3StreamDecodeVideo",
+]
 
 
 def _free_port() -> int:
