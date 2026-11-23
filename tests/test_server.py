@@ -25,6 +25,7 @@ IW3_NODES = [
     "IW3Stereo",
     "IW3ConvertVideo",
     "IW3StreamDecodeVideo",
+    "IW3StreamDecodeVideoRTX",
 ]
 
 

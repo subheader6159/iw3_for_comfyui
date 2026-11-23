@@ -45,6 +45,7 @@ def test_extension_nodes(custom_node, nodes):
         "IW3Stereo",
         "IW3ConvertVideo",
         "IW3StreamDecodeVideo",
+        "IW3StreamDecodeVideoRTX",
     ]
     for cls in node_list:
         schema = cls.define_schema()

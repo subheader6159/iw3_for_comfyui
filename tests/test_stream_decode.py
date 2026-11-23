@@ -201,3 +201,64 @@ def test_stream_decode_into_convert_video(nodes, wan_vae, wan_clip_latent):
     ).args
     info = probe_video(sbs.get_stream_source())
     assert (info["width"], info["height"], info["frames"]) == (896, 256, 37)
+
+
+class _FakeRTXVideoSuperResolution:
+    """Mirrors the execute() signature and output sizing of comfyui_nvidia_rtx_nodes' RTXVideoSuperResolution,
+    which needs nvidia-vfx and a newer RTX GPU than the test machine has."""
+
+    calls: list[int] = []
+
+    @classmethod
+    def execute(cls, images, resize_type, quality, strength=1.0, image_encoding="8-bit RGB"):
+        from comfy_api.latest import io
+
+        assert resize_type["resize_type"] == "scale by multiplier"
+        assert quality in ("ULTRA", "HIGH") and 0 <= strength <= 1 and image_encoding == "8-bit RGB"
+        cls.calls.append(images.shape[0])
+        b, h, w, _ = images.shape
+        out_h = max(8, round(int(h * resize_type["scale"]) / 8) * 8)
+        out_w = max(8, round(int(w * resize_type["scale"]) / 8) * 8)
+        up = F.interpolate(images.movedim(-1, 1), size=(out_h, out_w), mode="bilinear", align_corners=False)
+        return io.NodeOutput(up.movedim(1, -1))
+
+
+def test_rtx_stream_decode(nodes, wan_vae, wan_clip_latent, monkeypatch, artifacts_dir):
+    import nodes as comfy_nodes
+
+    _, latent = wan_clip_latent
+    _FakeRTXVideoSuperResolution.calls = []
+    monkeypatch.setitem(comfy_nodes.NODE_CLASS_MAPPINGS, "RTXVideoSuperResolution", _FakeRTXVideoSuperResolution)
+    (video,) = run(
+        nodes.IW3StreamDecodeVideoRTX,
+        samples={"samples": latent},
+        vae=wan_vae,
+        fps=24.0,
+        filename_prefix="iw3_test/stream_rtx",
+        rtx_scale=1.5,
+        rtx_quality="ULTRA",
+        temporal_size=16,
+        temporal_overlap=8,
+    ).args
+    info = probe_video(video.get_stream_source())
+    assert (info["width"], info["height"], info["frames"]) == (672, 384, 37)
+    # Upscaled chunk by chunk, never the whole clip at once.
+    assert len(_FakeRTXVideoSuperResolution.calls) > 1
+    assert sum(_FakeRTXVideoSuperResolution.calls) == 37
+    assert max(_FakeRTXVideoSuperResolution.calls) < 37
+
+
+def test_rtx_stream_decode_without_rtx_nodes(nodes, monkeypatch):
+    import nodes as comfy_nodes
+
+    monkeypatch.delitem(comfy_nodes.NODE_CLASS_MAPPINGS, "RTXVideoSuperResolution", raising=False)
+    with pytest.raises(RuntimeError, match="comfyui_nvidia_rtx_nodes"):
+        run(
+            nodes.IW3StreamDecodeVideoRTX,
+            samples={"samples": torch.rand(1, 16, 2, 4, 4)},
+            vae=None,
+            fps=24.0,
+            filename_prefix="iw3_test/stream_rtx_missing",
+            rtx_scale=2.0,
+            rtx_quality="ULTRA",
+        )

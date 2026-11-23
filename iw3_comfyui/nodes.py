@@ -623,6 +623,138 @@ class IW3ConvertVideo(io.ComfyNode):
         return io.NodeOutput(result, ui=preview)
 
 
+def _stream_decode_inputs() -> list[io.Input]:
+    return [
+        io.Latent.Input("samples"),
+        io.Vae.Input("vae"),
+        io.Float.Input("fps", default=24.0, min=1.0, max=240.0, step=1.0),
+        io.String.Input("filename_prefix", default="video/ComfyUI"),
+        io.Audio.Input("audio", optional=True, tooltip="Muxed into the file, e.g. from VAE Decode Audio."),
+        io.Int.Input("crf", default=18, min=0, max=51, **ADVANCED, tooltip="Lower is higher quality."),
+        io.Int.Input(
+            "temporal_size",
+            default=64,
+            min=8,
+            max=4096,
+            step=4,
+            **ADVANCED,
+            tooltip="Frames decoded at a time. Lower uses less RAM.",
+        ),
+        io.Int.Input(
+            "temporal_overlap",
+            default=8,
+            min=4,
+            max=4096,
+            step=4,
+            **ADVANCED,
+            tooltip="Frames shared between chunks, blended to hide the joins.",
+        ),
+        io.Int.Input(
+            "tile_size",
+            default=0,
+            min=0,
+            max=4096,
+            step=32,
+            **ADVANCED,
+            tooltip="Spatial tile size for VRAM savings, as in VAE Decode (Tiled). 0 = whole frame.",
+        ),
+        io.Int.Input("overlap", default=64, min=0, max=4096, step=32, **ADVANCED),
+    ]
+
+
+def _stream_decode_to_file(
+    hidden: Any,
+    samples: dict[str, Any],
+    vae: Any,
+    fps: float,
+    filename_prefix: str,
+    audio: dict[str, Any] | None = None,
+    crf: int = 18,
+    temporal_size: int = 64,
+    temporal_overlap: int = 8,
+    tile_size: int = 0,
+    overlap: int = 64,
+    post: Any = None,
+) -> io.NodeOutput:
+    """Shared body of the streaming decode nodes. `post` optionally transforms each chunk of frames."""
+    latent = samples["samples"]
+    if latent.is_nested:
+        latent = latent.unbind()[0]
+
+    # Same parameter handling as ComfyUI's VAE Decode (Tiled).
+    if tile_size and tile_size < overlap * 4:
+        overlap = tile_size // 4
+    if temporal_size < temporal_overlap * 2:
+        temporal_overlap = temporal_overlap // 2
+    compression = vae.spacial_compression_decode()
+
+    def decode(x: torch.Tensor) -> torch.Tensor:
+        if tile_size > 0:
+            t = x.shape[2] if x.ndim == 5 else None
+            images = vae.decode_tiled(
+                x,
+                tile_x=tile_size // compression,
+                tile_y=tile_size // compression,
+                overlap=overlap // compression,
+                tile_t=t,
+                overlap_t=1 if t is not None else None,
+            )
+        else:
+            images = vae.decode(x)
+        return images.reshape(-1, *images.shape[-3:])
+
+    full_output_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
+        filename_prefix, folder_paths.get_output_directory()
+    )
+    file = f"{filename}_{counter:05}_.mp4"
+    path = os.path.join(full_output_folder, file)
+    metadata: dict[str, Any] = {}
+    if hidden is not None and hidden.extra_pnginfo is not None:
+        metadata.update(hidden.extra_pnginfo)
+    if hidden is not None and hidden.prompt is not None:
+        metadata["prompt"] = hidden.prompt
+
+    writer = VideoFileWriter(path, fps=fps, crf=crf, metadata=metadata or None, audio=audio)
+
+    def write(frames: torch.Tensor) -> None:
+        writer.write(post(frames) if post is not None else frames)
+
+    try:
+        temporal_compression = vae.temporal_compression_decode()
+        if latent.ndim == 5 and temporal_compression is not None:
+            tile_t = max(2, temporal_size // temporal_compression)
+            overlap_t = max(1, min(tile_t // 2, temporal_overlap // temporal_compression))
+            upscale_t = vae.upscale_ratio[0]
+            index_formula = getattr(vae, "upscale_index_formula", None)
+            index_t = index_formula[0] if index_formula is not None else upscale_t
+            stream_temporal_decode(
+                latent,
+                decode,
+                write,
+                tile_t=tile_t,
+                overlap_t=overlap_t,
+                upscale_t=upscale_t,
+                index_t=index_t,
+                progress=_progress_callback(1),
+            )
+        else:
+            # Image VAE: the batch is the frame sequence, decode it in independent chunks.
+            progress = _progress_callback(latent.shape[0])
+            for start in range(0, latent.shape[0], temporal_size):
+                write(decode(latent[start : start + temporal_size]).float().cpu())
+                progress(min(start + temporal_size, latent.shape[0]), latent.shape[0])
+        writer.close()
+    except BaseException:
+        writer.abort()
+        if os.path.isfile(path):
+            os.unlink(path)
+        raise
+
+    result = InputImpl.VideoFromFile(path)
+    preview = ui.PreviewVideo([ui.SavedResult(file, subfolder, io.FolderType.output)])
+    return io.NodeOutput(result, ui=preview)
+
+
 class IW3StreamDecodeVideo(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -636,41 +768,96 @@ class IW3StreamDecodeVideo(io.ComfyNode):
                 "in the output folder, so RAM use does not grow with video length. Replaces VAE Decode + "
                 "Create Video + Save Video. The VIDEO output can feed iw3 Convert Video directly."
             ),
+            inputs=_stream_decode_inputs(),
+            hidden=[io.Hidden.prompt, io.Hidden.extra_pnginfo],
+            is_output_node=True,
+            outputs=[io.Video.Output("video")],
+        )
+
+    @classmethod
+    def execute(cls, **kwargs: Any) -> io.NodeOutput:
+        # cls.hidden is None when called outside of a ComfyUI prompt.
+        return _stream_decode_to_file(cls.hidden, **kwargs)
+
+
+# From nvidia-vfx 0.2 (nvvfx.QualityLevel), as offered by the RTX Video Super Resolution node.
+RTX_QUALITY_OPTIONS = [
+    "BICUBIC",
+    "LOW",
+    "MEDIUM",
+    "HIGH",
+    "ULTRA",
+    "DENOISE_LOW",
+    "DENOISE_MEDIUM",
+    "DENOISE_HIGH",
+    "DENOISE_ULTRA",
+    "DEBLUR_LOW",
+    "DEBLUR_MEDIUM",
+    "DEBLUR_HIGH",
+    "DEBLUR_ULTRA",
+    "HIGHBITRATE_LOW",
+    "HIGHBITRATE_MEDIUM",
+    "HIGHBITRATE_HIGH",
+    "HIGHBITRATE_ULTRA",
+    "STREAMING_MEDIUM",
+    "STREAMING_ULTRA",
+]
+RTX_ENCODINGS = ["8-bit RGB", "10-bit RGB (RGB10A2)"]
+RTX_NODE_ID = "RTXVideoSuperResolution"
+
+
+def _rtx_upscaler(scale: float, quality: str, strength: float, encoding: str) -> Any:
+    """Per-chunk RTX upscale using the installed RTX Video Super Resolution node (comfyui_nvidia_rtx_nodes).
+
+    RTX VSR processes every frame independently, so upscaling chunk by chunk equals upscaling the whole video.
+    """
+    import nodes as comfy_nodes
+
+    rtx_node = comfy_nodes.NODE_CLASS_MAPPINGS.get(RTX_NODE_ID)
+    if rtx_node is None:
+        raise RuntimeError(
+            "RTX upscaling needs the `RTX Video Super Resolution` node from the comfyui_nvidia_rtx_nodes pack. "
+            "Install it with ComfyUI Manager, or use `VAE Decode to Video File (streaming)` instead."
+        )
+
+    def upscale(frames: torch.Tensor) -> torch.Tensor:
+        out = rtx_node.execute(
+            images=frames,
+            resize_type={"resize_type": "scale by multiplier", "scale": scale},
+            quality=quality,
+            strength=strength,
+            image_encoding=encoding,
+        )
+        images = out.args[0] if hasattr(out, "args") else out[0]
+        return images.float().cpu()
+
+    return upscale
+
+
+class IW3StreamDecodeVideoRTX(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="IW3StreamDecodeVideoRTX",
+            display_name="VAE Decode to Video File + RTX Upscale (streaming)",
+            category=CATEGORY,
+            search_aliases=["stream decode rtx", "rtx upscale video", "low ram decode upscale", "vsr"],
+            description=(
+                "Like VAE Decode to Video File (streaming), but each decoded chunk is upscaled with NVIDIA RTX "
+                "Video Super Resolution before it is written, so RAM stays flat. Needs the "
+                "comfyui_nvidia_rtx_nodes pack and an RTX GPU it supports."
+            ),
             inputs=[
-                io.Latent.Input("samples"),
-                io.Vae.Input("vae"),
-                io.Float.Input("fps", default=24.0, min=1.0, max=240.0, step=1.0),
-                io.String.Input("filename_prefix", default="video/ComfyUI"),
-                io.Audio.Input("audio", optional=True, tooltip="Muxed into the file, e.g. from VAE Decode Audio."),
-                io.Int.Input("crf", default=18, min=0, max=51, **ADVANCED, tooltip="Lower is higher quality."),
-                io.Int.Input(
-                    "temporal_size",
-                    default=64,
-                    min=8,
-                    max=4096,
-                    step=4,
-                    **ADVANCED,
-                    tooltip="Frames decoded at a time. Lower uses less RAM.",
+                *_stream_decode_inputs(),
+                io.Float.Input("rtx_scale", default=2.0, min=1.0, max=4.0, step=0.01, tooltip="Upscale factor."),
+                io.Combo.Input(
+                    "rtx_quality",
+                    options=RTX_QUALITY_OPTIONS,
+                    default="ULTRA",
+                    tooltip="RTX model. DENOISE_* and DEBLUR_* keep the original size.",
                 ),
-                io.Int.Input(
-                    "temporal_overlap",
-                    default=8,
-                    min=4,
-                    max=4096,
-                    step=4,
-                    **ADVANCED,
-                    tooltip="Frames shared between chunks, blended to hide the joins.",
-                ),
-                io.Int.Input(
-                    "tile_size",
-                    default=0,
-                    min=0,
-                    max=4096,
-                    step=32,
-                    **ADVANCED,
-                    tooltip="Spatial tile size for VRAM savings, as in VAE Decode (Tiled). 0 = whole frame.",
-                ),
-                io.Int.Input("overlap", default=64, min=0, max=4096, step=32, **ADVANCED),
+                io.Float.Input("rtx_strength", default=1.0, min=0.0, max=1.0, step=0.01, **ADVANCED),
+                io.Combo.Input("rtx_image_encoding", options=RTX_ENCODINGS, default="8-bit RGB", **ADVANCED),
             ],
             hidden=[io.Hidden.prompt, io.Hidden.extra_pnginfo],
             is_output_node=True,
@@ -680,90 +867,14 @@ class IW3StreamDecodeVideo(io.ComfyNode):
     @classmethod
     def execute(
         cls,
-        samples: dict[str, Any],
-        vae: Any,
-        fps: float,
-        filename_prefix: str,
-        audio: dict[str, Any] | None = None,
-        crf: int = 18,
-        temporal_size: int = 64,
-        temporal_overlap: int = 8,
-        tile_size: int = 0,
-        overlap: int = 64,
+        rtx_scale: float,
+        rtx_quality: str,
+        rtx_strength: float = 1.0,
+        rtx_image_encoding: str = "8-bit RGB",
+        **kwargs: Any,
     ) -> io.NodeOutput:
-        latent = samples["samples"]
-        if latent.is_nested:
-            latent = latent.unbind()[0]
-
-        # Same parameter handling as ComfyUI's VAE Decode (Tiled).
-        if tile_size and tile_size < overlap * 4:
-            overlap = tile_size // 4
-        if temporal_size < temporal_overlap * 2:
-            temporal_overlap = temporal_overlap // 2
-        compression = vae.spacial_compression_decode()
-
-        def decode(x: torch.Tensor) -> torch.Tensor:
-            if tile_size > 0:
-                t = x.shape[2] if x.ndim == 5 else None
-                images = vae.decode_tiled(
-                    x,
-                    tile_x=tile_size // compression,
-                    tile_y=tile_size // compression,
-                    overlap=overlap // compression,
-                    tile_t=t,
-                    overlap_t=1 if t is not None else None,
-                )
-            else:
-                images = vae.decode(x)
-            return images.reshape(-1, *images.shape[-3:])
-
-        full_output_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
-            filename_prefix, folder_paths.get_output_directory()
-        )
-        file = f"{filename}_{counter:05}_.mp4"
-        path = os.path.join(full_output_folder, file)
-        metadata: dict[str, Any] = {}
-        hidden = cls.hidden  # None when called outside of a ComfyUI prompt
-        if hidden is not None and hidden.extra_pnginfo is not None:
-            metadata.update(hidden.extra_pnginfo)
-        if hidden is not None and hidden.prompt is not None:
-            metadata["prompt"] = hidden.prompt
-
-        writer = VideoFileWriter(path, fps=fps, crf=crf, metadata=metadata or None, audio=audio)
-        try:
-            temporal_compression = vae.temporal_compression_decode()
-            if latent.ndim == 5 and temporal_compression is not None:
-                tile_t = max(2, temporal_size // temporal_compression)
-                overlap_t = max(1, min(tile_t // 2, temporal_overlap // temporal_compression))
-                upscale_t = vae.upscale_ratio[0]
-                index_formula = getattr(vae, "upscale_index_formula", None)
-                index_t = index_formula[0] if index_formula is not None else upscale_t
-                stream_temporal_decode(
-                    latent,
-                    decode,
-                    writer.write,
-                    tile_t=tile_t,
-                    overlap_t=overlap_t,
-                    upscale_t=upscale_t,
-                    index_t=index_t,
-                    progress=_progress_callback(1),
-                )
-            else:
-                # Image VAE: the batch is the frame sequence, decode it in independent chunks.
-                progress = _progress_callback(latent.shape[0])
-                for start in range(0, latent.shape[0], temporal_size):
-                    writer.write(decode(latent[start : start + temporal_size]).float().cpu())
-                    progress(min(start + temporal_size, latent.shape[0]), latent.shape[0])
-            writer.close()
-        except BaseException:
-            writer.abort()
-            if os.path.isfile(path):
-                os.unlink(path)
-            raise
-
-        result = InputImpl.VideoFromFile(path)
-        preview = ui.PreviewVideo([ui.SavedResult(file, subfolder, io.FolderType.output)])
-        return io.NodeOutput(result, ui=preview)
+        post = _rtx_upscaler(rtx_scale, rtx_quality, rtx_strength, rtx_image_encoding)
+        return _stream_decode_to_file(cls.hidden, post=post, **kwargs)
 
 
 class IW3Extension(ComfyExtension):
@@ -776,6 +887,7 @@ class IW3Extension(ComfyExtension):
             IW3Stereo,
             IW3ConvertVideo,
             IW3StreamDecodeVideo,
+            IW3StreamDecodeVideoRTX,
         ]
 
 
