@@ -262,3 +262,89 @@ def test_rtx_stream_decode_without_rtx_nodes(nodes, monkeypatch):
             rtx_scale=2.0,
             rtx_quality="ULTRA",
         )
+
+
+class _FakeRTXVideoFrameGeneration:
+    """Mirrors RTXVideoFrameGeneration.execute() (multiplier mode) with linear blending instead of nvidia-vfx."""
+
+    calls: list[int] = []
+
+    @classmethod
+    def execute(cls, images, generation_type, mode, automatic_shot_change_detection, shot_change, image_encoding):
+        from comfy_api.latest import io
+
+        assert generation_type["generation_type"] == "frame rate multiplier"
+        assert mode in ("LOW", "MEDIUM", "HIGH") and shot_change is False
+        cls.calls.append(images.shape[0])
+        m = generation_type["multiplier"]
+        out = [images[0]]
+        for prev, cur in zip(images[:-1], images[1:]):
+            out += [prev + (cur - prev) * (k / m) for k in range(1, m)]
+            out.append(cur)
+        return io.NodeOutput(torch.stack(out))
+
+
+@pytest.mark.parametrize("multiplier", [2, 3])
+def test_rtx_frame_generation_across_chunks(nodes, monkeypatch, multiplier):
+    import nodes as comfy_nodes
+
+    monkeypatch.setitem(comfy_nodes.NODE_CLASS_MAPPINGS, "RTXVideoFrameGeneration", _FakeRTXVideoFrameGeneration)
+    frames = torch.rand(23, 4, 6, 3)
+    interpolate = nodes._rtx_frame_generator(multiplier, "MEDIUM", True, "8-bit RGB")
+    chunked = torch.cat([interpolate(frames[s : s + 7]) for s in range(0, 23, 7)])
+    generation_type = {"generation_type": "frame rate multiplier", "multiplier": multiplier}
+    whole = _FakeRTXVideoFrameGeneration.execute(frames, generation_type, "MEDIUM", True, False, "8-bit RGB").args[0]
+    assert chunked.shape[0] == (23 - 1) * multiplier + 1
+    torch.testing.assert_close(chunked, whole)
+
+
+def test_rtx_stream_decode_with_frame_generation(nodes, wan_vae, wan_clip_latent, monkeypatch):
+    import nodes as comfy_nodes
+
+    _, latent = wan_clip_latent
+    monkeypatch.setitem(comfy_nodes.NODE_CLASS_MAPPINGS, "RTXVideoSuperResolution", _FakeRTXVideoSuperResolution)
+    monkeypatch.setitem(comfy_nodes.NODE_CLASS_MAPPINGS, "RTXVideoFrameGeneration", _FakeRTXVideoFrameGeneration)
+    _FakeRTXVideoFrameGeneration.calls = []
+    sr = 48000
+    (video,) = run(
+        nodes.IW3StreamDecodeVideoRTX,
+        samples={"samples": latent},
+        vae=wan_vae,
+        fps=24.0,
+        filename_prefix="iw3_test/stream_rtx_fg",
+        audio={"waveform": torch.zeros(1, 2, sr * 2), "sample_rate": sr},
+        rtx_scale=1.5,
+        rtx_quality="ULTRA",
+        rtx_frame_multiplier=2,
+        temporal_size=16,
+        temporal_overlap=8,
+    ).args
+    import av
+
+    path = video.get_stream_source()
+    info = probe_video(path)
+    assert (info["width"], info["height"], info["frames"]) == (672, 384, (37 - 1) * 2 + 1)
+    assert info["has_audio"]
+    with av.open(path) as c:
+        assert c.streams.video[0].average_rate == 48
+    assert len(_FakeRTXVideoFrameGeneration.calls) > 1
+
+
+def test_rtx_scale_one_skips_upscaler(nodes, wan_vae, wan_clip_latent, monkeypatch):
+    import nodes as comfy_nodes
+
+    _, latent = wan_clip_latent
+    monkeypatch.delitem(comfy_nodes.NODE_CLASS_MAPPINGS, "RTXVideoSuperResolution", raising=False)
+    monkeypatch.setitem(comfy_nodes.NODE_CLASS_MAPPINGS, "RTXVideoFrameGeneration", _FakeRTXVideoFrameGeneration)
+    (video,) = run(
+        nodes.IW3StreamDecodeVideoRTX,
+        samples={"samples": latent},
+        vae=wan_vae,
+        fps=24.0,
+        filename_prefix="iw3_test/stream_rtx_fg_only",
+        rtx_scale=1.0,
+        rtx_quality="ULTRA",
+        rtx_frame_multiplier=2,
+    ).args
+    info = probe_video(video.get_stream_source())
+    assert (info["width"], info["height"], info["frames"]) == (448, 256, 73)

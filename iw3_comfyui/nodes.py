@@ -675,6 +675,7 @@ def _stream_decode_to_file(
     tile_size: int = 0,
     overlap: int = 64,
     post: Any = None,
+    output_fps: float | None = None,
 ) -> io.NodeOutput:
     """Shared body of the streaming decode nodes. `post` optionally transforms each chunk of frames."""
     latent = samples["samples"]
@@ -714,7 +715,7 @@ def _stream_decode_to_file(
     if hidden is not None and hidden.prompt is not None:
         metadata["prompt"] = hidden.prompt
 
-    writer = VideoFileWriter(path, fps=fps, crf=crf, metadata=metadata or None, audio=audio)
+    writer = VideoFileWriter(path, fps=output_fps or fps, crf=crf, metadata=metadata or None, audio=audio)
 
     def write(frames: torch.Tensor) -> None:
         writer.write(post(frames) if post is not None else frames)
@@ -804,6 +805,50 @@ RTX_QUALITY_OPTIONS = [
 ]
 RTX_ENCODINGS = ["8-bit RGB", "10-bit RGB (RGB10A2)"]
 RTX_NODE_ID = "RTXVideoSuperResolution"
+RTX_FRAME_GENERATION_NODE_ID = "RTXVideoFrameGeneration"
+RTX_FRAME_GENERATION_MODES = ["LOW", "MEDIUM", "HIGH"]
+
+
+def _rtx_node(node_id: str, display_name: str) -> Any:
+    import nodes as comfy_nodes
+
+    node = comfy_nodes.NODE_CLASS_MAPPINGS.get(node_id)
+    if node is None:
+        raise RuntimeError(
+            f"This needs the `{display_name}` node from the comfyui_nvidia_rtx_nodes pack. "
+            "Install it with ComfyUI Manager, or use `VAE Decode to Video File (streaming)` instead."
+        )
+    return node
+
+
+def _node_images(out: Any) -> torch.Tensor:
+    images = out.args[0] if hasattr(out, "args") else out[0]
+    return images.float().cpu()
+
+
+def _rtx_frame_generator(multiplier: int, mode: str, shot_detection: bool, encoding: str) -> Any:
+    """Per-chunk RTX frame interpolation. Each chunk starts with the previous chunk's last frame,
+    so frames are also generated across chunk joins. N input frames become (N - 1) * multiplier + 1."""
+    rtx_node = _rtx_node(RTX_FRAME_GENERATION_NODE_ID, "RTX Video Frame Generation")
+    last: list[torch.Tensor] = []
+
+    def interpolate(frames: torch.Tensor) -> torch.Tensor:
+        joined = torch.cat([last[0], frames]) if last else frames
+        out = _node_images(
+            rtx_node.execute(
+                images=joined,
+                generation_type={"generation_type": "frame rate multiplier", "multiplier": multiplier},
+                mode=mode,
+                automatic_shot_change_detection=shot_detection,
+                shot_change=False,
+                image_encoding=encoding,
+            )
+        )
+        result = out[1:] if last else out  # the carried frame was already written
+        last[:] = [frames[-1:].clone()]
+        return result
+
+    return interpolate
 
 
 def _rtx_upscaler(scale: float, quality: str, strength: float, encoding: str) -> Any:
@@ -811,14 +856,7 @@ def _rtx_upscaler(scale: float, quality: str, strength: float, encoding: str) ->
 
     RTX VSR processes every frame independently, so upscaling chunk by chunk equals upscaling the whole video.
     """
-    import nodes as comfy_nodes
-
-    rtx_node = comfy_nodes.NODE_CLASS_MAPPINGS.get(RTX_NODE_ID)
-    if rtx_node is None:
-        raise RuntimeError(
-            "RTX upscaling needs the `RTX Video Super Resolution` node from the comfyui_nvidia_rtx_nodes pack. "
-            "Install it with ComfyUI Manager, or use `VAE Decode to Video File (streaming)` instead."
-        )
+    rtx_node = _rtx_node(RTX_NODE_ID, "RTX Video Super Resolution")
 
     def upscale(frames: torch.Tensor) -> torch.Tensor:
         out = rtx_node.execute(
@@ -828,8 +866,7 @@ def _rtx_upscaler(scale: float, quality: str, strength: float, encoding: str) ->
             strength=strength,
             image_encoding=encoding,
         )
-        images = out.args[0] if hasattr(out, "args") else out[0]
-        return images.float().cpu()
+        return _node_images(out)
 
     return upscale
 
@@ -843,9 +880,9 @@ class IW3StreamDecodeVideoRTX(io.ComfyNode):
             category=CATEGORY,
             search_aliases=["stream decode rtx", "rtx upscale video", "low ram decode upscale", "vsr"],
             description=(
-                "Like VAE Decode to Video File (streaming), but each decoded chunk is upscaled with NVIDIA RTX "
-                "Video Super Resolution before it is written, so RAM stays flat. Needs the "
-                "comfyui_nvidia_rtx_nodes pack and an RTX GPU it supports."
+                "Like VAE Decode to Video File (streaming), but each decoded chunk is optionally interpolated "
+                "(RTX Video Frame Generation) and upscaled (RTX Video Super Resolution) before it is written, "
+                "so RAM stays flat. Needs the comfyui_nvidia_rtx_nodes pack and an RTX GPU it supports."
             ),
             inputs=[
                 *_stream_decode_inputs(),
@@ -858,6 +895,28 @@ class IW3StreamDecodeVideoRTX(io.ComfyNode):
                 ),
                 io.Float.Input("rtx_strength", default=1.0, min=0.0, max=1.0, step=0.01, **ADVANCED),
                 io.Combo.Input("rtx_image_encoding", options=RTX_ENCODINGS, default="8-bit RGB", **ADVANCED),
+                io.Int.Input(
+                    "rtx_frame_multiplier",
+                    default=1,
+                    min=1,
+                    max=16,
+                    tooltip=(
+                        "RTX frame generation (interpolation). 1 = off, 2 = double the frame rate (24 -> 48 fps). "
+                        "Set fps to the source frame rate; the output frame rate is fps x multiplier."
+                    ),
+                ),
+                io.Combo.Input(
+                    "rtx_frame_generation_mode",
+                    options=RTX_FRAME_GENERATION_MODES,
+                    default="MEDIUM",
+                    **ADVANCED,
+                ),
+                io.Boolean.Input(
+                    "rtx_shot_change_detection",
+                    default=True,
+                    **ADVANCED,
+                    tooltip="Do not interpolate across scene cuts.",
+                ),
             ],
             hidden=[io.Hidden.prompt, io.Hidden.extra_pnginfo],
             is_output_node=True,
@@ -871,10 +930,30 @@ class IW3StreamDecodeVideoRTX(io.ComfyNode):
         rtx_quality: str,
         rtx_strength: float = 1.0,
         rtx_image_encoding: str = "8-bit RGB",
+        rtx_frame_multiplier: int = 1,
+        rtx_frame_generation_mode: str = "MEDIUM",
+        rtx_shot_change_detection: bool = True,
         **kwargs: Any,
     ) -> io.NodeOutput:
-        post = _rtx_upscaler(rtx_scale, rtx_quality, rtx_strength, rtx_image_encoding)
-        return _stream_decode_to_file(cls.hidden, post=post, **kwargs)
+        steps = []
+        # Interpolate before upscaling: frame generation runs on the smaller frames.
+        if rtx_frame_multiplier > 1:
+            steps.append(
+                _rtx_frame_generator(
+                    rtx_frame_multiplier, rtx_frame_generation_mode, rtx_shot_change_detection, rtx_image_encoding
+                )
+            )
+        if rtx_scale != 1.0 or rtx_quality.startswith(("DENOISE_", "DEBLUR_")):
+            steps.append(_rtx_upscaler(rtx_scale, rtx_quality, rtx_strength, rtx_image_encoding))
+
+        def post(frames: torch.Tensor) -> torch.Tensor:
+            for step in steps:
+                frames = step(frames)
+            return frames
+
+        return _stream_decode_to_file(
+            cls.hidden, post=post, output_fps=kwargs.get("fps", 24.0) * rtx_frame_multiplier, **kwargs
+        )
 
 
 class IW3Extension(ComfyExtension):
