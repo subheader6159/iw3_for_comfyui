@@ -1,0 +1,13 @@
+av>=19.0.2
+timm>=1.0.30
+safetensors
+einops
+omegaconf
+addict
+pillow_heif
+simpleeval
+scipy
+pyyaml
+packaging
+requests
+tqdm
