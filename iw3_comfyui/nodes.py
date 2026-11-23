@@ -1,3 +1,4 @@
+import logging
 import os
 import threading
 import uuid
@@ -50,7 +51,7 @@ from .pipeline import (  # noqa: E402
     generate_stereo,
     image_to_depth,
 )
-from .stream_decode import VideoFileWriter, stream_temporal_decode  # noqa: E402
+from .stream_decode import FrameSink, VideoFileWriter, stream_temporal_decode  # noqa: E402
 from .video import convert_video_file, resolve_video_source  # noqa: E402
 
 CATEGORY = "iw3"
@@ -662,6 +663,15 @@ def _stream_decode_inputs() -> list[io.Input]:
     ]
 
 
+def _decode_chunked_io(vae: Any, samples: torch.Tensor, sink: Any) -> None:
+    """vae.decode() for chunked-IO VAEs, writing into `sink` instead of a preallocated tensor."""
+    vae.throw_exception_if_invalid()
+    memory_used = vae.memory_used_decode(samples.shape, vae.vae_dtype)
+    mm.load_models_gpu([vae.patcher], memory_required=memory_used, force_full_load=vae.disable_offload)
+    with torch.inference_mode(), mm.cuda_device_context(vae.device):
+        vae.first_stage_model.decode(samples.to(device=vae.device, dtype=vae.vae_dtype), output_buffer=sink)
+
+
 def _stream_decode_to_file(
     hidden: Any,
     samples: dict[str, Any],
@@ -722,7 +732,29 @@ def _stream_decode_to_file(
 
     try:
         temporal_compression = vae.temporal_compression_decode()
-        if latent.ndim == 5 and temporal_compression is not None:
+        first_stage: Any = getattr(vae, "first_stage_model", None)
+        if latent.ndim == 5 and getattr(first_stage, "comfy_has_chunked_io", False):
+            # VAEs like MiniMax H3 / LTX chunk the video themselves and write finished frames in order.
+            # Stream those writes to the file; slicing their latents ourselves would break their chunking.
+            progress = _progress_callback(1)
+            for b in range(latent.shape[0]):
+                samples_b = latent[b : b + 1]
+                shape = tuple(first_stage.decode_output_shape(samples_b.shape))
+                total = shape[2]
+
+                def sink_write(frames: torch.Tensor, total: int = total, b: int = b) -> None:
+                    write(frames)
+                    progress(b * total + sink.next_frame + frames.shape[0], total * latent.shape[0])
+
+                sink = FrameSink(shape, sink_write)
+                _decode_chunked_io(vae, samples_b, sink)
+                if sink.next_frame != total:
+                    raise RuntimeError(f"The VAE wrote {sink.next_frame} of {total} frames")
+        elif latent.ndim == 5 and getattr(vae, "handles_tiling", False):
+            # Model-owned tiling without chunked IO: its temporal layout is unknown, so decode it in one go.
+            logging.warning("iw3: this VAE cannot be decoded in chunks; decoding the whole video at once.")
+            write(decode(latent).float().cpu())
+        elif latent.ndim == 5 and temporal_compression is not None:
             tile_t = max(2, temporal_size // temporal_compression)
             overlap_t = max(1, min(tile_t // 2, temporal_overlap // temporal_compression))
             upscale_t = vae.upscale_ratio[0]

@@ -204,3 +204,76 @@ class VideoFileWriter:
             self.container.close()
         except Exception:
             pass
+
+
+class FrameSink:
+    """Stand-in for the `output_buffer` tensor of VAEs with chunked IO (`comfy_has_chunked_io`).
+
+    Those VAEs decode with their own temporal chunking and write finished frames in order with
+    `output_buffer[:, :, start:end].copy_(pixels)`. The sink forwards each write to `write` as (N, H, W, C)
+    frames instead of keeping them, so the decoded video never has to fit in memory.
+    """
+
+    def __init__(self, shape: tuple[int, ...], write: Callable[[torch.Tensor], None]):
+        if len(shape) != 5 or shape[0] != 1:
+            raise ValueError(f"FrameSink supports a single video (1, C, T, H, W), got {tuple(shape)}")
+        self.shape = torch.Size(shape)
+        self.ndim = 5
+        self.write = write
+        self.next_frame = 0
+
+    def size(self, dim: int | None = None) -> Any:
+        return self.shape if dim is None else self.shape[dim]
+
+    def __getitem__(self, index: Any) -> "_FrameSinkView":
+        return _FrameSinkView(self, 0, self.shape[2])[index]
+
+    def copy_(self, src: torch.Tensor) -> "FrameSink":
+        _FrameSinkView(self, 0, self.shape[2]).copy_(src)
+        return self
+
+    def receive(self, start: int, frames: torch.Tensor) -> None:
+        if start != self.next_frame:
+            raise RuntimeError(
+                f"The VAE wrote frames out of order (frame {start}, expected {self.next_frame}); "
+                "it cannot be streamed to a file."
+            )
+        # (1, C, F, H, W) -> (F, H, W, C)
+        self.write(frames[0].movedim(0, -1).float().cpu())
+        self.next_frame += frames.shape[2]
+
+
+class _FrameSinkView:
+    def __init__(self, sink: FrameSink, start: int, stop: int):
+        self.sink = sink
+        self.start = start
+        self.stop = stop
+        self.shape = torch.Size((1, sink.shape[1], stop - start, *sink.shape[3:]))
+        self.ndim = 5
+
+    def size(self, dim: int | None = None) -> Any:
+        return self.shape if dim is None else self.shape[dim]
+
+    def __getitem__(self, index: Any) -> "_FrameSinkView":
+        if not isinstance(index, tuple):
+            index = (index,)
+        index = index + (slice(None),) * (5 - len(index))
+        for d in (0, 1, 3, 4):
+            s = index[d]
+            if not (isinstance(s, slice) and s.step in (None, 1) and (s.start or 0) == 0):
+                raise RuntimeError(f"Unsupported output_buffer index {index}; only frame ranges can be streamed.")
+            if s.stop is not None and s.stop < self.shape[d]:
+                raise RuntimeError(f"Unsupported output_buffer index {index}; only frame ranges can be streamed.")
+        f = index[2]
+        if not (isinstance(f, slice) and f.step in (None, 1)):
+            raise RuntimeError(f"Unsupported output_buffer frame index {f}.")
+        length = self.stop - self.start
+        lo, hi, _ = f.indices(length)
+        return _FrameSinkView(self.sink, self.start + lo, self.start + max(lo, hi))
+
+    def copy_(self, src: torch.Tensor) -> "_FrameSinkView":
+        if src.shape[2] != self.stop - self.start:
+            frames = self.stop - self.start
+            raise RuntimeError(f"output_buffer write of {src.shape[2]} frames into a {frames} frame range")
+        self.sink.receive(self.start, src)
+        return self

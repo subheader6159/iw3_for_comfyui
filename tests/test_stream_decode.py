@@ -348,3 +348,54 @@ def test_rtx_scale_one_skips_upscaler(nodes, wan_vae, wan_clip_latent, monkeypat
     ).args
     info = probe_video(video.get_stream_source())
     assert (info["width"], info["height"], info["frames"]) == (448, 256, 73)
+
+
+@pytest.fixture(scope="module")
+def tiny_h3_vae(require_gpu):
+    """A randomly initialized, 1-layer MiniMax H3 video VAE: same chunked decoding code as the real one."""
+    import comfy.ldm.minimax.vae as minimax_vae
+    import comfy.sd
+
+    torch.manual_seed(0)
+    model = minimax_vae.MiniMaxH3VideoVAE(num_layers=1, encoder=False)
+    sd = {
+        k: v if k.startswith(("latents_", "pixel_")) or not v.is_floating_point() else torch.randn_like(v) * 0.02
+        for k, v in model.state_dict().items()
+    }
+    vae = comfy.sd.VAE(sd=sd)
+    assert getattr(vae.first_stage_model, "comfy_has_chunked_io", False)
+    return vae
+
+
+def test_chunked_io_vae_streams_exact_frames(nodes, stream, tiny_h3_vae):
+    latent = torch.randn(1, 24, 22, 4, 6)  # several of the VAE's own 17-frame chunks
+    with torch.inference_mode():
+        expected = tiny_h3_vae.decode(latent).reshape(-1, 64, 96, 3).float().cpu()
+    chunks = []
+    shape = tuple(tiny_h3_vae.first_stage_model.decode_output_shape(latent.shape))
+    sink = stream.FrameSink(shape, chunks.append)
+    nodes._decode_chunked_io(tiny_h3_vae, latent, sink)
+    got = torch.cat(chunks)
+    assert len(chunks) > 1 and max(c.shape[0] for c in chunks) < got.shape[0]
+    torch.testing.assert_close(got, expected, atol=1e-5, rtol=0)
+
+
+def test_chunked_io_vae_node(nodes, tiny_h3_vae, monkeypatch):
+    import nodes as comfy_nodes
+
+    monkeypatch.setitem(comfy_nodes.NODE_CLASS_MAPPINGS, "RTXVideoSuperResolution", _FakeRTXVideoSuperResolution)
+    monkeypatch.setitem(comfy_nodes.NODE_CLASS_MAPPINGS, "RTXVideoFrameGeneration", _FakeRTXVideoFrameGeneration)
+    latent = torch.randn(1, 24, 22, 4, 6)
+    frames = tiny_h3_vae.upscale_ratio[0](22)
+    (video,) = run(
+        nodes.IW3StreamDecodeVideoRTX,
+        samples={"samples": latent},
+        vae=tiny_h3_vae,
+        fps=24.0,
+        filename_prefix="iw3_test/stream_h3",
+        rtx_scale=2.0,
+        rtx_quality="ULTRA",
+        rtx_frame_multiplier=2,
+    ).args
+    info = probe_video(video.get_stream_source())
+    assert (info["width"], info["height"], info["frames"]) == (192, 128, (frames - 1) * 2 + 1)
