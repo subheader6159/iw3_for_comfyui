@@ -22,7 +22,10 @@ def resolve_video_source(video: Any, temp_dir: str) -> tuple[str, bool]:
     Returns (path, is_temporary_copy).
     """
     start, duration = video.get_active_trim_window()
-    trimmed_or_cropped = start > 0 or duration > 0 or video.get_active_crop_rect() is not None
+    # Cropping was added to ComfyUI's VIDEO type after v0.46.0.
+    get_crop = getattr(video, "get_active_crop_rect", None)
+    cropped = get_crop is not None and get_crop() is not None
+    trimmed_or_cropped = start > 0 or duration > 0 or cropped
     if isinstance(video, InputImpl.VideoFromFile) and not trimmed_or_cropped:
         src = video.get_stream_source()
         if isinstance(src, (str, os.PathLike)):

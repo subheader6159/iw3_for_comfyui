@@ -9,7 +9,7 @@
       "type": "LoadVideo",
       "pos": [
         100,
-        130
+        320
       ],
       "size": [
         282.798828125,
@@ -92,7 +92,7 @@
       "type": "IW3LoadDepthModel",
       "pos": [
         100,
-        320
+        130
       ],
       "size": [
         270,
@@ -196,7 +196,7 @@
         "Node name for S&R": "IW3LoadDepthModel"
       },
       "widgets_values": [
-        "DepthPro2_S",
+        "DepthPro2_L",
         0,
         false,
         false
@@ -925,11 +925,11 @@
         "Node name for S&R": "IW3ConvertVideo"
       },
       "widgets_values": [
-        "mlbw_l2s",
-        2,
+        "mlbw_l2",
+        4.0,
         0.25,
         0,
-        "VR90",
+        "Full SBS",
         true,
         "dubois",
         "constant",
@@ -958,9 +958,9 @@
         false,
         false,
         false,
-        30,
+        60,
         "auto",
-        20,
+        18,
         "medium",
         "yuv420p"
       ],
@@ -1125,7 +1125,7 @@
       ],
       "properties": {},
       "widgets_values": [
-        "vr/iw3_180x180_LR",
+        "vr/iw3_LRF_Full_SBS",
         "auto",
         "auto",
         "auto"

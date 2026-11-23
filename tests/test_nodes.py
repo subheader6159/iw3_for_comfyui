@@ -375,3 +375,15 @@ def test_frames_are_encoded_at_high_quality(nodes, clip, tmp_path):
     ours, default = _psnr(read_frame(path, 5), source), _psnr(read_frame(default_path, 5), source)
     print(f"PSNR intermediate={ours:.2f}dB comfy_default={default:.2f}dB")
     assert ours > 42.0 and ours > default + 5.0
+
+
+def test_video_without_crop_support(nodes, video_file, tmp_path, monkeypatch):
+    # ComfyUI <= v0.46.0 has no get_active_crop_rect on VIDEO inputs.
+    from comfy_api.latest import Input, InputImpl
+
+    monkeypatch.delattr(InputImpl.VideoFromFile, "get_active_crop_rect")
+    monkeypatch.delattr(Input.Video, "get_active_crop_rect")
+    video_module = __import__(nodes.__name__.rsplit(".", 1)[0] + ".video", fromlist=["resolve_video_source"])
+    video = InputImpl.VideoFromFile(video_file)
+    assert not hasattr(video, "get_active_crop_rect")
+    assert video_module.resolve_video_source(video, str(tmp_path)) == (video_file, False)
