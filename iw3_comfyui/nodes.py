@@ -266,6 +266,15 @@ def _depth_inputs() -> list[io.Input]:
         io.Int.Input("edge_dilation_y", default=1, min=0, max=8, **ADVANCED, tooltip="iw3 Edge Fix (y)."),
         io.Boolean.Input("depth_aa", default=False, **ADVANCED, tooltip="Depth anti-aliasing (some models)."),
         io.Boolean.Input("tta", default=False, **ADVANCED, tooltip="Flip test-time augmentation for depth."),
+        io.Boolean.Input(
+            "low_vram",
+            default=False,
+            **ADVANCED,
+            tooltip=(
+                "iw3 --low-vram. Depth Pro 2 uses a shorter clip window (8 instead of 16 frames); "
+                "Convert Video processes one frame at a time."
+            ),
+        ),
     ]
 
 
@@ -278,6 +287,7 @@ DEPTH_OPTION_KEYS = [
     "edge_dilation_y",
     "depth_aa",
     "tta",
+    "low_vram",
 ]
 
 
@@ -333,7 +343,8 @@ class IW3LoadDepthModel(io.ComfyNode):
                     default=DEFAULT_DEPTH_MODEL,
                     tooltip=(
                         "Any_V3_Mono / Any_V2_S / Distill_Any_S are good general choices. "
-                        "VDA_* (Video Depth Anything) are temporally stable but video only. "
+                        "VDA_* (Video Depth Anything) and DepthPro2_* (Apple Depth Pro 2) are temporally stable; "
+                        "VDA_* and DepthPro2_Stream_* are video only. "
                         "Some models have no automatic download and must be placed manually."
                     ),
                 ),

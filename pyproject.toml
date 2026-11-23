@@ -12,6 +12,7 @@ dependencies = [
   "omegaconf",
   "addict",
   "pillow_heif",
+  "huggingface_hub",
   "simpleeval",
   "scipy",
   "pyyaml",

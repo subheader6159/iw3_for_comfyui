@@ -293,3 +293,85 @@ def test_interrupt(nodes, depth_model, clip, video_depth, video_file):
             _convert(nodes, InputImpl.VideoFromFile(video_file), depth_model)
     finally:
         mm.interrupt_current_processing(False)
+
+
+@pytest.fixture(scope="module")
+def require_depth_pro2(nodes):
+    if "DepthPro2_S" not in nodes.DEPTH_MODEL_TYPES:
+        pytest.skip("this nunif checkout has no Depth Pro 2 (iw3/depth_models/depth_pro2_model.py)")
+
+
+@pytest.fixture(scope="module")
+def depth_pro2(nodes, require_gpu, require_depth_pro2):
+    (handle,) = run(nodes.IW3LoadDepthModel, depth_model="DepthPro2_S")
+    return handle
+
+
+@pytest.mark.parametrize("low_vram", [False, True])
+def test_depth_pro2_video(nodes, depth_pro2, low_vram):
+    # 20 frames with a cut after frame 9: covers clip windows (16/4, or 8/2 with low_vram),
+    # the flush at the scene cut and the final flush.
+    frames = render_clip(20, H, W, scene_cut_at=9)
+    depth, _ = run(
+        nodes.IW3EstimateDepth,
+        images=frames,
+        depth_model=depth_pro2,
+        batch_mode="video",
+        flicker_reduction=True,
+        scene_detect=True,
+        low_vram=low_vram,
+    )
+    assert len(depth) == 20
+    assert depth.scene_boundaries & {8, 9, 10}, depth.scene_boundaries
+    d = depth.depth.float()
+    h = d.shape[-2]
+    assert d[..., -h // 8 :, :].mean() > d[..., : h // 8, :].mean() + 0.3
+
+
+def test_depth_pro2_images(nodes, depth_pro2, clip):
+    depth, _ = run(
+        nodes.IW3EstimateDepth, images=clip[:3], depth_model=depth_pro2, batch_mode="images", flicker_reduction=True
+    )
+    assert len(depth) == 3 and not depth.is_video
+
+
+def test_depth_pro2_stream(nodes, clip, require_gpu, require_depth_pro2):
+    (stream,) = run(nodes.IW3LoadDepthModel, depth_model="DepthPro2_Stream_S")
+    depth, _ = run(nodes.IW3EstimateDepth, images=clip, depth_model=stream, batch_mode="video", flicker_reduction=True)
+    assert len(depth) == clip.shape[0]
+    with pytest.raises(ValueError):
+        run(nodes.IW3EstimateDepth, images=clip, depth_model=stream, batch_mode="images", flicker_reduction=True)
+
+
+def test_depth_pro2_convert_video(nodes, depth_pro2, video_file):
+    from comfy_api.latest import InputImpl
+
+    out = _convert(nodes, InputImpl.VideoFromFile(video_file), depth_pro2, low_vram=True)
+    info = probe_video(out.get_stream_source())
+    assert (info["width"], info["height"]) == (W * 2, H)
+    assert info["frames"] == 36
+    assert info["has_audio"]
+
+
+def _psnr(a: np.ndarray, b: np.ndarray) -> float:
+    mse = np.mean((a.astype(np.float64) - b.astype(np.float64)) ** 2)
+    return float(10 * np.log10(255.0**2 / max(mse, 1e-10)))
+
+
+def test_frames_are_encoded_at_high_quality(nodes, clip, tmp_path):
+    from fractions import Fraction
+
+    from comfy_api.latest import InputImpl, Types
+
+    video_module = __import__(nodes.__name__.rsplit(".", 1)[0] + ".video", fromlist=["resolve_video_source"])
+    video = InputImpl.VideoFromComponents(Types.VideoComponents(images=clip, audio=None, frame_rate=Fraction(16)))
+    path, is_temporary = video_module.resolve_video_source(video, str(tmp_path))
+    assert is_temporary
+    default_path = str(tmp_path / "default.mp4")
+    with open(default_path, "wb") as f:
+        f.write(video.get_stream_source().getbuffer())
+
+    source = (clip[5].numpy() * 255).round().astype(np.uint8)
+    ours, default = _psnr(read_frame(path, 5), source), _psnr(read_frame(default_path, 5), source)
+    print(f"PSNR intermediate={ours:.2f}dB comfy_default={default:.2f}dB")
+    assert ours > 42.0 and ours > default + 5.0

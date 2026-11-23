@@ -77,6 +77,7 @@ class DepthOptions:
     edge_dilation_y: int = 1
     depth_aa: bool = False
     tta: bool = False
+    low_vram: bool = False
 
 
 @dataclass
@@ -158,6 +159,7 @@ def build_args(
             edge_dilation=[int(depth.edge_dilation), int(depth.edge_dilation_y)],
             depth_aa=bool(depth.depth_aa),
             tta=bool(depth.tta),
+            low_vram=bool(depth.low_vram),
         )
     if video is not None:
         values.update(

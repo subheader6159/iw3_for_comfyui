@@ -4,10 +4,10 @@ import os
 import uuid
 from typing import Any
 
-from comfy_api.latest import Types
+from comfy_api.latest import InputImpl, Types
 from iw3.utils import process_video
 
-# Quality of the intermediate file written when a VIDEO has to be re-encoded before conversion.
+# Quality of the intermediate file written when a VIDEO has to be encoded before conversion.
 INTERMEDIATE_CRF = 12
 
 
@@ -17,32 +17,36 @@ def _temp_video_path(temp_dir: str) -> str:
 
 
 def resolve_video_source(video: Any, temp_dir: str) -> tuple[str, bool]:
-    """Get a file path for a ComfyUI VIDEO without decoding it into memory when possible.
+    """Get a file path for a ComfyUI VIDEO, avoiding decoding and re-encoding where possible.
 
     Returns (path, is_temporary_copy).
     """
     start, duration = video.get_active_trim_window()
-    if start > 0 or duration > 0 or video.get_active_crop_rect() is not None:
-        # iw3's own --start-time/--end-time are keyframe-granular and can drop frames at the end,
-        # so trimmed/cropped videos are cut frame-accurately by ComfyUI first.
-        path = _temp_video_path(temp_dir)
-        video.save_to(
-            path,
-            format=Types.VideoContainer.MP4,
-            codec=Types.VideoCodec.H264,
-            crf=INTERMEDIATE_CRF,
-        )
-        return path, True
+    trimmed_or_cropped = start > 0 or duration > 0 or video.get_active_crop_rect() is not None
+    if isinstance(video, InputImpl.VideoFromFile) and not trimmed_or_cropped:
+        src = video.get_stream_source()
+        if isinstance(src, (str, os.PathLike)):
+            return os.fspath(src), False
+        if isinstance(src, io.BytesIO):
+            path = _temp_video_path(temp_dir)
+            with open(path, "wb") as f:
+                f.write(src.getbuffer())
+            return path, True
+        raise TypeError(f"Unsupported video source: {type(src).__name__}")
 
-    src = video.get_stream_source()
-    if isinstance(src, (str, os.PathLike)):
-        return os.fspath(src), False
-    if isinstance(src, io.BytesIO):
-        path = _temp_video_path(temp_dir)
-        with open(path, "wb") as f:
-            f.write(src.getbuffer())
-        return path, True
-    raise TypeError(f"Unsupported video source: {type(src).__name__}")
+    # Frames from other nodes (Create Video, ...) must be encoded first. ComfyUI's default (crf 18, 4:2:0)
+    # loses color detail, so a near-lossless 4:4:4 file is written instead.
+    # Trimmed/cropped files are also cut here, because iw3's own --start-time/--end-time are keyframe-granular
+    # and can drop frames at the end.
+    path = _temp_video_path(temp_dir)
+    video.save_to(
+        path,
+        format=Types.VideoContainer.MP4,
+        codec=Types.VideoCodec.H264,
+        crf=INTERMEDIATE_CRF,
+        chroma_subsampling="444",
+    )
+    return path, True
 
 
 def convert_video_file(

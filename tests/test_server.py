@@ -185,3 +185,16 @@ def test_convert_video_workflow(comfy, object_info, input_video, artifacts_dir):
     assert info["has_audio"]
     assert info["width"] == info["height"] * 2
     Image.fromarray(read_frame(path, 12)).save(os.path.join(artifacts_dir, "server_vr90_frame.png"))
+
+
+def test_example_workflows(comfy, object_info):
+    from conftest import REPO_ROOT
+
+    workflow_dir = os.path.join(REPO_ROOT, "example_workflows")
+    names = [os.path.splitext(f)[0] for f in os.listdir(workflow_dir) if f.endswith(".json")]
+    assert set(comfy.get("/api/workflow_templates")["iw3_for_comfyui"]) == set(names)
+    for name in names:
+        with open(os.path.join(workflow_dir, f"{name}.json")) as f:
+            workflow = json.load(f)
+        for item in workflow["nodes"]:
+            assert item["type"] in object_info, f"{name}: unknown node {item['type']}"
